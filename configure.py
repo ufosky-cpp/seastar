@@ -295,6 +295,7 @@ tests = [
     ] + perf_tests
 
 apps = [
+    'apps/hello_world/hello_world',
     'apps/httpd/httpd',
     'apps/seawreck/seawreck',
     'apps/io_tester/io_tester',
@@ -489,6 +490,7 @@ deps = {
     'libseastar.a' : core + libnet + http + protobuf + prometheus,
     'seastar.pc': [],
     'fmt/fmt/libfmt.a': [],
+    'apps/hello_world/hello_world': ['apps/hello_world/hello_world.cc'] + core,
     'apps/httpd/httpd': ['apps/httpd/demo.json', 'apps/httpd/main.cc'] + http + libnet + core,
     'apps/memcached/memcached': ['apps/memcached/memcache.cc'] + memcache_base,
     'tests/memcached/test_ascii_parser': ['tests/memcached/test_ascii_parser.cc'] + memcache_base,
