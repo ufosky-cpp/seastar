@@ -53,6 +53,37 @@ add_library(seastar_core
         util/log.cc
         util/program-options.cc)
 
+add_library(seastar_net
+        net/proxy.cc
+        net/virtio.cc
+        net/dpdk.cc
+        net/ip.cc
+        net/ethernet.cc
+        net/arp.cc
+        net/native-stack.cc
+        net/ip_checksum.cc
+        net/udp.cc
+        net/tcp.cc
+        net/dhcp.cc
+        net/tls.cc
+        net/dns.cc
+        net/config.cc)
+
+add_library(seastar_http
+        http/transformers.cc
+        http/json_path.cc
+        http/file_handler.cc
+        http/common.cc
+        http/routes.cc
+        json/json_elements.cc
+        json/formatter.cc
+        http/matcher.cc
+        http/mime_types.cc
+        http/httpd.cc
+        http/reply.cc
+        http/request_parser.rl
+        http/api_docs.cc)
+
 add_executable(hello_world apps/hello_world/hello_world.cc)
 add_dependencies(hello_world seastar_core fmt::fmt)
 target_link_libraries(hello_world seastar_core fmt::fmt ${Boost_LIBRARIES} rt hwloc numa pthread dl unwind)
