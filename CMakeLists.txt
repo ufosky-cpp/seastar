@@ -11,16 +11,24 @@ set(CMAKE_CPP_FLAGS "-Wall -DHAVE_HWLOC -DHAVE_NUMA -DHAVE_LZ4_COMPRESS_DEFAULT 
 set(CMAKE_CXX_FLAGS "${CMAKE_CPP_FLAGS}")
 set(CMAKE_C_FLAGS "${CMAKE_CPP_FLAGS}")
 
+set(CARES_STATIC ON CACHE BOOL "Build as a static library")
+
 #set(CUSTOM_ROOT $ENV{HOME}/.root)
 #list(APPEND CMAKE_FIND_ROOT_PATH ${CUSTOM_ROOT})
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 
 find_package(Boost COMPONENTS program_options filesystem thread system REQUIRED)
+find_package(RAGEL REQUIRED)
 
 add_subdirectory(fmt)
+add_subdirectory(c-ares)
 
 include_directories(
         ${CMAKE_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
         ${CMAKE_SOURCE_DIR}/fmt
+        ${CMAKE_SOURCE_DIR}/c-ares
+        ${CMAKE_CURRENT_BINARY_DIR}/c-ares
         ${Boost_INCLUDE_DIRS}
 )
 
@@ -52,6 +60,7 @@ add_library(seastar_core
         util/conversions.cc
         util/log.cc
         util/program-options.cc)
+add_dependencies(seastar_core fmt::fmt)
 
 add_library(seastar_net
         net/proxy.cc
@@ -68,7 +77,9 @@ add_library(seastar_net
         net/tls.cc
         net/dns.cc
         net/config.cc)
+add_dependencies(seastar_net seastar_core c-ares::cares_static)
 
+add_subdirectory(http)
 add_library(seastar_http
         http/transformers.cc
         http/json_path.cc
@@ -81,9 +92,14 @@ add_library(seastar_http
         http/mime_types.cc
         http/httpd.cc
         http/reply.cc
-        http/request_parser.rl
         http/api_docs.cc)
+add_dependencies(seastar_http seastar_net)
 
 add_executable(hello_world apps/hello_world/hello_world.cc)
 add_dependencies(hello_world seastar_core fmt::fmt)
 target_link_libraries(hello_world seastar_core fmt::fmt ${Boost_LIBRARIES} rt hwloc numa pthread dl unwind)
+
+add_subdirectory(apps/httpd)
+add_executable(httpd apps/httpd/main.cc)
+add_dependencies(httpd seastar_http)
+target_link_libraries(httpd seastar_http seastar_net seastar_core fmt::fmt ${Boost_LIBRARIES} rt hwloc numa pthread dl unwind)

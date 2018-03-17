@@ -1,0 +1,8 @@
+function(generate_ragel input output)
+    set(ragel_cmd "${RAGEL_EXECUTABLE} -G2 -o ${output} ${input} && sed -i -e '1h\;2,$H\;$!d\;g' -re 's/static const char _nfa[^;]*\;//g' ${output}")
+    message(STATUS ${ragel_cmd})
+    execute_process(COMMAND sh -c ${ragel_cmd})
+endfunction(generate_ragel)
+
+generate_ragel(${CMAKE_CURRENT_SOURCE_DIR}/http_response_parser.rl ${CMAKE_CURRENT_BINARY_DIR}/http_response_parser.hh)
+generate_ragel(${CMAKE_CURRENT_SOURCE_DIR}/request_parser.rl ${CMAKE_CURRENT_BINARY_DIR}/request_parser.hh)
