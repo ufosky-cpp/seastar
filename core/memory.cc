@@ -49,6 +49,8 @@
 //
 // Runs of pages are organized into spans.  Free spans are organized into lists,
 // by size.  When spans are broken up or coalesced, they may move into new lists.
+// Spans have a size that is a power-of-two and are naturally aligned (aka buddy
+// allocator)
 
 #include "cacheline.hh"
 #include "memory.hh"
@@ -260,16 +262,6 @@ public:
         }
         _front = ary[_front].link._next;
     }
-    page* find(uint32_t n_pages, page* ary) {
-        auto n = _front;
-        while (n && ary[n].span_size < n_pages) {
-            n = ary[n].link._next;
-        }
-        if (!n) {
-            return nullptr;
-        }
-        return &ary[n];
-    }
     friend void on_allocation_failure(size_t);
 };
 
@@ -382,17 +374,7 @@ struct cpu_pages {
     std::function<void (std::function<void ()>)> reclaim_hook;
     std::vector<reclaimer*> reclaimers;
     static constexpr unsigned nr_span_lists = 32;
-    union pla {
-        pla() {
-            for (auto&& e : free_spans) {
-                new (&e) page_list;
-            }
-        }
-        ~pla() {
-            // no destructor -- might be freeing after we die
-        }
-        page_list free_spans[nr_span_lists];  // contains spans with span_size >= 2^idx
-    } fsu;
+    page_list free_spans[nr_span_lists];  // contains aligned spans with span_size == 2^idx
     small_pool_array small_pools;
     alignas(seastar::cache_line_size) std::atomic<cross_cpu_free_item*> xcpu_freelist;
     alignas(seastar::cache_line_size) std::vector<physical_address> virt_to_phys_map;
@@ -400,8 +382,7 @@ struct cpu_pages {
     static cpu_pages* all_cpus[max_cpus];
     union asu {
         using alloc_sites_type = std::unordered_set<allocation_site>;
-        asu() {
-            new (&alloc_sites) alloc_sites_type();
+        asu() : alloc_sites{} {
         }
         ~asu() {} // alloc_sites live forever
         alloc_sites_type alloc_sites;
@@ -417,15 +398,16 @@ struct cpu_pages {
         unsigned nr_pages;
     };
     void maybe_reclaim();
-    template <typename Trimmer>
-    void* allocate_large_and_trim(unsigned nr_pages, Trimmer trimmer);
+    void* allocate_large_and_trim(unsigned nr_pages);
     void* allocate_large(unsigned nr_pages);
     void* allocate_large_aligned(unsigned align_pages, unsigned nr_pages);
     page* find_and_unlink_span(unsigned nr_pages);
     page* find_and_unlink_span_reclaiming(unsigned n_pages);
     void free_large(void* ptr);
+    bool grow_span(pageidx& start, uint32_t& nr_pages, unsigned idx);
     void free_span(pageidx start, uint32_t nr_pages);
     void free_span_no_merge(pageidx start, uint32_t nr_pages);
+    void free_span_unaligned(pageidx start, uint32_t nr_pages);
     void* allocate_small(unsigned size);
     void free(void* ptr);
     void free(void* ptr, size_t size);
@@ -473,15 +455,9 @@ void set_heap_profiling_enabled(bool enable) {
     cpu_mem.collect_backtrace = enable;
 }
 
-// Free spans are store in the largest index i such that nr_pages >= 1 << i.
-static inline
-unsigned index_of(unsigned pages) {
-    return std::numeric_limits<unsigned>::digits - count_leading_zeros(pages) - 1;
-}
-
 // Smallest index i such that all spans stored in the index are >= pages.
 static inline
-unsigned index_of_conservative(unsigned pages) {
+unsigned index_of(unsigned pages) {
     if (pages == 1) {
         return 0;
     }
@@ -506,55 +482,64 @@ void cpu_pages::free_span_no_merge(uint32_t span_start, uint32_t nr_pages) {
     span->free = span_end->free = true;
     span->span_size = span_end->span_size = nr_pages;
     auto idx = index_of(nr_pages);
-    link(fsu.free_spans[idx], span);
+    link(free_spans[idx], span);
+}
+
+bool cpu_pages::grow_span(uint32_t& span_start, uint32_t& nr_pages, unsigned idx) {
+    auto which = (span_start >> idx) & 1; // 0=lower, 1=upper
+    // locate first page of upper buddy or last page of lower buddy
+    // examples: span_start = 0x10 nr_pages = 0x08 -> buddy = 0x18  (which = 0)
+    //           span_start = 0x18 nr_pages = 0x08 -> buddy = 0x17  (which = 1)
+    // delta = which ? -1u : nr_pages
+    auto delta = ((which ^ 1) << idx) | -which;
+    auto buddy = span_start + delta;
+    if (pages[buddy].free && pages[buddy].span_size == nr_pages) {
+        unlink(free_spans[idx], &pages[span_start ^ nr_pages]);
+        nr_free_pages -= nr_pages; // free_span_no_merge() will restore
+        span_start &= ~nr_pages;
+        nr_pages *= 2;
+        return true;
+    }
+    return false;
 }
 
 void cpu_pages::free_span(uint32_t span_start, uint32_t nr_pages) {
-    page* before = &pages[span_start - 1];
-    if (before->free) {
-        auto b_size = before->span_size;
-        assert(b_size);
-        span_start -= b_size;
-        nr_pages += b_size;
-        nr_free_pages -= b_size;
-        unlink(fsu.free_spans[index_of(b_size)], before - (b_size - 1));
-    }
-    page* after = &pages[span_start + nr_pages];
-    if (after->free) {
-        auto a_size = after->span_size;
-        assert(a_size);
-        nr_pages += a_size;
-        nr_free_pages -= a_size;
-        unlink(fsu.free_spans[index_of(a_size)], after);
+    auto idx = index_of(nr_pages);
+    while (grow_span(span_start, nr_pages, idx)) {
+        ++idx;
     }
     free_span_no_merge(span_start, nr_pages);
 }
 
+// Internal, used during startup. Span is not aligned so needs to be broken up
+void cpu_pages::free_span_unaligned(uint32_t span_start, uint32_t nr_pages) {
+    while (nr_pages) {
+        auto start_nr_bits = span_start ? count_trailing_zeros(span_start) : 32;
+        auto size_nr_bits = count_trailing_zeros(nr_pages);
+        auto now = 1u << std::min(start_nr_bits, size_nr_bits);
+        free_span(span_start, now);
+        span_start += now;
+        nr_pages -= now;
+    }
+}
+
 page*
 cpu_pages::find_and_unlink_span(unsigned n_pages) {
-    auto idx = index_of_conservative(n_pages);
-    auto orig_idx = idx;
+    auto idx = index_of(n_pages);
     if (n_pages >= (2u << idx)) {
         return nullptr;
     }
-    while (idx < nr_span_lists && fsu.free_spans[idx].empty()) {
+    while (idx < nr_span_lists && free_spans[idx].empty()) {
         ++idx;
     }
     if (idx == nr_span_lists) {
         if (initialize()) {
             return find_and_unlink_span(n_pages);
         }
-        // Can smaller list possibly hold object?
-        idx = index_of(n_pages);
-        if (idx == orig_idx) {   // was exact power of two
-            return nullptr;
-        }
-    }
-    auto& list = fsu.free_spans[idx];
-    page* span = list.find(n_pages, pages);
-    if (!span) {
         return nullptr;
     }
+    auto& list = free_spans[idx];
+    page* span = &list.front(pages);
     unlink(list, span);
     return span;
 }
@@ -582,9 +567,8 @@ void cpu_pages::maybe_reclaim() {
     }
 }
 
-template <typename Trimmer>
 void*
-cpu_pages::allocate_large_and_trim(unsigned n_pages, Trimmer trimmer) {
+cpu_pages::allocate_large_and_trim(unsigned n_pages) {
     // Avoid exercising the reclaimers for requests we'll not be able to satisfy
     // nr_pages might be zero during startup, so check for that too
     if (nr_pages && n_pages >= nr_pages) {
@@ -597,20 +581,14 @@ cpu_pages::allocate_large_and_trim(unsigned n_pages, Trimmer trimmer) {
     auto span_size = span->span_size;
     auto span_idx = span - pages;
     nr_free_pages -= span->span_size;
-    trim t = trimmer(span_idx, nr_pages);
-    if (t.offset) {
-        free_span_no_merge(span_idx, t.offset);
-        span_idx += t.offset;
-        span_size -= t.offset;
-        span = &pages[span_idx];
-
+    while (span_size >= n_pages * 2) {
+        span_size /= 2;
+        auto other_span_idx = span_idx + span_size;
+        free_span_no_merge(other_span_idx, span_size);
     }
-    if (t.nr_pages < span_size) {
-        free_span_no_merge(span_idx + t.nr_pages, span_size - t.nr_pages);
-    }
-    auto span_end = &pages[span_idx + t.nr_pages - 1];
+    auto span_end = &pages[span_idx + span_size - 1];
     span->free = span_end->free = false;
-    span->span_size = span_end->span_size = t.nr_pages;
+    span->span_size = span_end->span_size = span_size;
     span->pool = nullptr;
 #ifdef SEASTAR_HEAPPROF
     auto alloc_site = get_allocation_site();
@@ -641,17 +619,14 @@ cpu_pages::check_large_allocation(size_t size) {
 void*
 cpu_pages::allocate_large(unsigned n_pages) {
     check_large_allocation(n_pages * page_size);
-    return allocate_large_and_trim(n_pages, [n_pages] (unsigned idx, unsigned n) {
-        return trim{0, std::min(n, n_pages)};
-    });
+    return allocate_large_and_trim(n_pages);
 }
 
 void*
 cpu_pages::allocate_large_aligned(unsigned align_pages, unsigned n_pages) {
     check_large_allocation(n_pages * page_size);
-    return allocate_large_and_trim(n_pages + align_pages - 1, [=] (unsigned idx, unsigned n) {
-        return trim{align_up(idx, align_pages) - idx, n_pages};
-    });
+    // buddy allocation is always aligned
+    return allocate_large_and_trim(n_pages);
 }
 
 #ifdef SEASTAR_HEAPPROF
@@ -846,9 +821,11 @@ void cpu_pages::shrink(void* ptr, size_t new_size) {
     if (span->pool) {
         return;
     }
-    size_t new_size_pages = align_up(new_size, page_size) / page_size;
     auto old_size_pages = span->span_size;
-    assert(old_size_pages >= new_size_pages);
+    size_t new_size_pages = old_size_pages;
+    while (new_size_pages / 2 * page_size >= new_size) {
+        new_size_pages /= 2;
+    }
     if (new_size_pages == old_size_pages) {
         return;
     }
@@ -863,7 +840,7 @@ void cpu_pages::shrink(void* ptr, size_t new_size) {
     span[new_size_pages - 1].free = false;
     span[new_size_pages - 1].span_size = new_size_pages;
     pageidx idx = span - pages;
-    free_span(idx + new_size_pages, old_size_pages - new_size_pages);
+    free_span_unaligned(idx + new_size_pages, old_size_pages - new_size_pages);
 }
 
 cpu_pages::~cpu_pages() {
@@ -897,11 +874,12 @@ bool cpu_pages::initialize() {
     // we reserve the end page so we don't have to special case
     // the last span.
     auto reserved = align_up(sizeof(page) * (nr_pages + 1), page_size) / page_size;
+    reserved = 1u << log2ceil(reserved);
     for (pageidx i = 0; i < reserved; ++i) {
         pages[i].free = false;
     }
     pages[nr_pages].free = false;
-    free_span_no_merge(reserved, nr_pages - reserved);
+    free_span_unaligned(reserved, nr_pages - reserved);
     live_cpus[cpu_id].store(true, std::memory_order_relaxed);
     return true;
 }
@@ -997,6 +975,7 @@ void cpu_pages::do_resize(size_t new_size, allocate_system_memory_fn alloc_sys_m
     auto old_pages = reinterpret_cast<char*>(pages);
     auto old_nr_pages = nr_pages;
     auto old_pages_size = align_up(sizeof(page[nr_pages + 1]), page_size);
+    old_pages_size = size_t(1) << log2ceil(old_pages_size);
     pages = new_page_array;
     nr_pages = new_pages;
     auto old_pages_start = (old_pages - memory) / page_size;
@@ -1006,9 +985,9 @@ void cpu_pages::do_resize(size_t new_size, allocate_system_memory_fn alloc_sys_m
         old_pages_size -= page_size;
     }
     if (old_pages_size != 0) {
-        free_span(old_pages_start, old_pages_size / page_size);
+        free_span_unaligned(old_pages_start, old_pages_size / page_size);
     }
-    free_span(old_nr_pages, new_pages - old_nr_pages);
+    free_span_unaligned(old_nr_pages, new_pages - old_nr_pages);
 }
 
 void cpu_pages::resize(size_t new_size, allocate_system_memory_fn alloc_memory) {
@@ -1461,7 +1440,7 @@ void on_allocation_failure(size_t size) {
         seastar_memory_logger.debug("Page spans:");
         seastar_memory_logger.debug("index size [B]     free [B]");
         for (unsigned i = 0; i< cpu_mem.nr_span_lists; i++) {
-            auto& span_list = cpu_mem.fsu.free_spans[i];
+            auto& span_list = cpu_mem.free_spans[i];
             auto front = span_list._front;
             uint32_t total = 0;
             while(front) {
