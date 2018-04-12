@@ -19,6 +19,7 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 
 find_package(Boost COMPONENTS program_options filesystem thread system REQUIRED)
 find_package(RAGEL REQUIRED)
+find_package(Libunwind REQUIRED)
 
 add_subdirectory(fmt)
 add_subdirectory(c-ares)
