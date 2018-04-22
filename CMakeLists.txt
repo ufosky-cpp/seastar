@@ -34,6 +34,7 @@ include_directories(
 )
 
 add_library(seastar_core
+        core/alien.cc
         core/app-template.cc
         core/dpdk_rte.cc
         core/exception_hacks.cc
@@ -62,6 +63,7 @@ add_library(seastar_core
         util/log.cc
         util/program-options.cc)
 add_dependencies(seastar_core fmt::fmt)
+target_link_libraries(seastar_core fmt::fmt ${Boost_LIBRARIES} yaml-cpp pthread dl hwloc numa unwind rt)
 
 add_library(seastar_net
         net/proxy.cc
@@ -79,6 +81,7 @@ add_library(seastar_net
         net/dns.cc
         net/config.cc)
 add_dependencies(seastar_net seastar_core c-ares::cares_static)
+target_link_libraries(seastar_net seastar_core c-ares::cares_static)
 
 add_subdirectory(http)
 add_library(seastar_http
@@ -95,12 +98,24 @@ add_library(seastar_http
         http/reply.cc
         http/api_docs.cc)
 add_dependencies(seastar_http seastar_net)
+target_link_libraries(seastar_http seastar_net)
+
+add_library(seastar_prometheus
+        core/prometheus.cc)
+add_dependencies(seastar_prometheus seastar_core)
+target_link_libraries(seastar_prometheus seastar_core)
+
+add_subdirectory(proto)
+
+add_library(seastar)
+add_dependencies(seastar seastar_core seastar_net seastar_http seastar_prometheus seastar_protobuf)
+target_link_libraries(seastar seastar_core seastar_net seastar_http seastar_prometheus seastar_protobuf)
 
 add_executable(hello_world apps/hello_world/hello_world.cc)
-add_dependencies(hello_world seastar_core fmt::fmt)
-target_link_libraries(hello_world seastar_core fmt::fmt ${Boost_LIBRARIES} rt hwloc numa pthread dl unwind)
+add_dependencies(hello_world seastar)
+target_link_libraries(hello_world seastar)
 
 add_subdirectory(apps/httpd)
 add_executable(httpd apps/httpd/main.cc)
-add_dependencies(httpd seastar_http)
-target_link_libraries(httpd seastar_http seastar_net seastar_core fmt::fmt ${Boost_LIBRARIES} rt hwloc numa pthread dl unwind)
+add_dependencies(httpd seastar)
+target_link_libraries(httpd seastar)
