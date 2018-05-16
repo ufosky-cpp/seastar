@@ -33,6 +33,9 @@ include_directories(
         ${Boost_INCLUDE_DIRS}
 )
 
+#add_library(dpdk)
+#target_link_libraries(dpdk -Wl,--whole-archive rte_pmd_vmxnet3_uio rte_pmd_i40e rte_pmd_ixgbe rte_pmd_e1000 rte_pmd_ring rte_pmd_bnxt rte_pmd_cxgbe rte_pmd_ena rte_pmd_enic rte_pmd_fm10k rte_pmd_nfp rte_pmd_qede rte_pmd_sfc_efx rte_hash rte_kvargs rte_mbuf rte_ethdev rte_eal rte_mempool rte_mempool_ring rte_ring rte_cmdline rte_cfgfile)
+
 add_library(seastar_core
         core/alien.cc
         core/app-template.cc
@@ -63,7 +66,12 @@ add_library(seastar_core
         util/log.cc
         util/program-options.cc)
 add_dependencies(seastar_core fmt::fmt)
-target_link_libraries(seastar_core fmt::fmt ${Boost_LIBRARIES} yaml-cpp pthread dl hwloc numa unwind rt)
+target_compile_definitions(seastar_core PRIVATE -DHAVE_DPDK)
+target_link_libraries(seastar_core
+        -Wl,--whole-archive rte_pmd_vmxnet3_uio rte_pmd_i40e rte_pmd_ixgbe rte_pmd_e1000 rte_pmd_ring rte_pmd_bnxt rte_pmd_cxgbe rte_pmd_ena rte_pmd_enic rte_pmd_fm10k rte_pmd_nfp rte_pmd_qede rte_pmd_sfc_efx rte_hash rte_kvargs rte_mbuf rte_ethdev rte_eal rte_mempool rte_mempool_ring rte_ring rte_cmdline rte_cfgfile
+        -Wl,--no-whole-archive fmt::fmt ${Boost_LIBRARIES} yaml-cpp pthread dl hwloc numa unwind rt lz4
+        )
+target_include_directories(seastar_core PUBLIC /usr/include/dpdk)
 
 add_library(seastar_net
         net/proxy.cc
@@ -81,7 +89,8 @@ add_library(seastar_net
         net/dns.cc
         net/config.cc)
 add_dependencies(seastar_net seastar_core c-ares::cares_static)
-target_link_libraries(seastar_net seastar_core c-ares::cares_static)
+target_link_libraries(seastar_net
+        -Wl,--no-whole-archive seastar_core c-ares::cares_static gnutls cryptopp)
 
 add_subdirectory(http)
 add_library(seastar_http
@@ -109,7 +118,9 @@ add_subdirectory(proto)
 
 add_library(seastar)
 add_dependencies(seastar seastar_core seastar_net seastar_http seastar_prometheus seastar_protobuf)
-target_link_libraries(seastar seastar_core seastar_net seastar_http seastar_prometheus seastar_protobuf)
+target_link_libraries(seastar
+        -Wl,--whole-archive seastar_net
+        -Wl,--no-whole-archive seastar_core seastar_http seastar_prometheus seastar_protobuf)
 
 add_executable(hello_world apps/hello_world/hello_world.cc)
 add_dependencies(hello_world seastar)
@@ -118,4 +129,5 @@ target_link_libraries(hello_world seastar)
 add_subdirectory(apps/httpd)
 add_executable(httpd apps/httpd/main.cc)
 add_dependencies(httpd seastar)
-target_link_libraries(httpd seastar)
+target_link_libraries(httpd
+        -Wl,--whole-archive seastar)
